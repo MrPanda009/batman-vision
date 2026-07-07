@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import collections
@@ -33,10 +34,12 @@ def main():
         print("SUCCESS: MPS is available.")
         device = "mps"
 
-    print("Loading prompt-free YOLOE model (yoloe-11s-seg-pf.pt)...")
-    # Load the smallest available YOLOE checkpoint in prompt-free mode
-    model = YOLOE("../models/yoloe-26s-seg-pf.pt")
-    print("Model loaded successfully.")
+    print("Loading prompt-free YOLOE model (yoloe-26s-seg-pf.pt)...")
+    # Load the YOLOE checkpoint using path relative to this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.abspath(os.path.join(script_dir, "../models/yoloe-26s-seg-pf.pt"))
+    model = YOLOE(model_path)
+    print(f"Model loaded successfully from {model_path}.")
 
     print("Opening default webcam (device 0)...")
     cap = cv2.VideoCapture(0)
@@ -54,20 +57,36 @@ def main():
     # BGR color for Cyan (HUD style)
     hud_color = (255, 255, 0)
 
+    # Dictionary to store active tracking IDs from the previous frame: track_id -> class_name
+    active_tracks = {}
+
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Error: Failed to read frame from webcam.")
             break
 
-        # Run YOLOE inference with device='mps' (or fallback)
+        # Run YOLOE tracking with device='mps' (or fallback)
         # We specify conf=0.4 to filter out low-confidence detections early
-        results = model(frame, device=device, conf=0.4, verbose=False)
+        # persist=True maintains tracking state between frames
+        results = model.track(
+            frame, 
+            persist=True, 
+            tracker="bytetrack.yaml", 
+            device=device, 
+            conf=0.4, 
+            verbose=False
+        )
         
-        # Process detections
-        if results and len(results) > 0:
+        current_tracks = {}
+
+        # Process detections & tracks
+        if results and len(results) > 0 and results[0].boxes is not None:
             boxes = results[0].boxes
-            for box in boxes:
+            has_ids = boxes.id is not None
+            track_ids = boxes.id.int().cpu().tolist() if has_ids else []
+            
+            for i, box in enumerate(boxes):
                 # Bounding box coordinates (xyxy)
                 xyxy = box.xyxy[0].cpu().numpy()
                 x1, y1, x2, y2 = map(int, xyxy)
@@ -82,8 +101,13 @@ def main():
                 # Draw bounding box (thin line)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), hud_color, 1)
                 
-                # Format label
-                label_text = f"{class_name} {conf:.2f}"
+                # Get tracking ID if available
+                if has_ids and i < len(track_ids):
+                    track_id = track_ids[i]
+                    current_tracks[track_id] = class_name
+                    label_text = f"ID {track_id} | {class_name} {conf:.2f}"
+                else:
+                    label_text = f"{class_name} {conf:.2f}"
                 
                 # Get text size for background box
                 (text_w, text_h), baseline = cv2.getTextSize(
@@ -112,6 +136,18 @@ def main():
                     1,
                     cv2.LINE_AA
                 )
+
+        # Log to the console whenever a track ID appears or disappears
+        new_ids = set(current_tracks.keys()) - set(active_tracks.keys())
+        disappeared_ids = set(active_tracks.keys()) - set(current_tracks.keys())
+        
+        for tid in new_ids:
+            print(f"[TRACKER] New track ID appeared: ID {tid} ({current_tracks[tid]})")
+            
+        for tid in disappeared_ids:
+            print(f"[TRACKER] Track ID disappeared: ID {tid} ({active_tracks[tid]})")
+            
+        active_tracks = current_tracks
 
         # Calculate Running FPS (averaged over the last 30 frames)
         curr_time = time.perf_counter()
