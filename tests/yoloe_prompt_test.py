@@ -11,7 +11,7 @@ from ultralytics.utils import SETTINGS
 
 # Define the custom classes you want the model to detect and label.
 # You can modify this list as needed.
-CUSTOM_CLASSES = ["person", "cup", "chair", "cell phone", "bottle", "keyboard", "mouse"]
+CUSTOM_CLASSES = ["person", "cup", "bag", "cell phone", "bottle", "keyboard", "mouse"]
 
 # Setup paths relative to this script
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
