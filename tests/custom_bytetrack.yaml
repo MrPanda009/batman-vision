@@ -1,0 +1,10 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Custom ByteTrack tracker settings with increased buffer and dual thresholds
+
+tracker_type: bytetrack # (str) Tracker backend: bytetrack
+track_high_thresh: 0.50 # (float) First-stage match threshold for starting/matching high-conf tracks
+track_low_thresh: 0.10 # (float) Second-stage threshold for low-score matches (continuing to associate existing ones)
+new_track_thresh: 0.60 # (float) Start a new track if no match >= this
+track_buffer: 100 # (int) Frames to keep lost tracks alive (increased from 30)
+match_thresh: 0.8 # (float) Association similarity threshold (IoU/cost)
+fuse_score: True # (bool) Fuse detection score with motion/IoU for matching

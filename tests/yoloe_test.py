@@ -40,6 +40,9 @@ def main():
     model_path = os.path.abspath(os.path.join(script_dir, "../models/yoloe-26l-seg-pf.pt"))
     model = YOLOE(model_path)
     print(f"Model loaded successfully from {model_path}.")
+    
+    # Path to custom ByteTrack configuration
+    tracker_path = os.path.abspath(os.path.join(script_dir, "custom_bytetrack.yaml"))
 
     print("Opening default webcam (device 0)...")
     cap = cv2.VideoCapture(0)
@@ -66,15 +69,24 @@ def main():
             print("Error: Failed to read frame from webcam.")
             break
 
+        # Calculate time delta for instantaneous FPS and rolling FPS
+        curr_time = time.perf_counter()
+        dt = curr_time - prev_time
+        prev_time = curr_time
+        frame_times.append(dt)
+        inst_fps = 1.0 / dt if dt > 0 else 0.0
+
         # Run YOLOE tracking with device='mps' (or fallback)
-        # We specify conf=0.4 to filter out low-confidence detections early
+        # We specify the custom ByteTrack config file.
+        # We specify conf=0.1 matching track_low_thresh so that low-confidence
+        # detections are not pre-filtered and can be used for track association.
         # persist=True maintains tracking state between frames
         results = model.track(
             frame, 
             persist=True, 
-            tracker="bytetrack.yaml", 
+            tracker=tracker_path, 
             device=device, 
-            conf=0.4, 
+            conf=0.1, 
             verbose=False
         )
         
@@ -142,19 +154,14 @@ def main():
         disappeared_ids = set(active_tracks.keys()) - set(current_tracks.keys())
         
         for tid in new_ids:
-            print(f"[TRACKER] New track ID appeared: ID {tid} ({current_tracks[tid]})")
+            print(f"[TRACKER] [FPS: {inst_fps:.1f}] New track ID appeared: ID {tid} ({current_tracks[tid]})")
             
         for tid in disappeared_ids:
-            print(f"[TRACKER] Track ID disappeared: ID {tid} ({active_tracks[tid]})")
+            print(f"[TRACKER] [FPS: {inst_fps:.1f}] Track ID disappeared: ID {tid} ({active_tracks[tid]})")
             
         active_tracks = current_tracks
 
         # Calculate Running FPS (averaged over the last 30 frames)
-        curr_time = time.perf_counter()
-        dt = curr_time - prev_time
-        prev_time = curr_time
-        frame_times.append(dt)
-        
         fps = len(frame_times) / sum(frame_times) if frame_times else 0.0
         fps_text = f"FPS: {fps:.1f}"
         
