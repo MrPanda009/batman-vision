@@ -34,7 +34,7 @@ def main():
         print("SUCCESS: MPS is available.")
         device = "mps"
 
-    print("Loading prompt-free YOLOE model (yoloe-26s-seg-pf.pt)...")
+    print("Loading prompt-free YOLOE model (yoloe-26l-seg-pf.pt)...")
     # Load the YOLOE checkpoint using path relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     model_path = os.path.abspath(os.path.join(script_dir, "../models/yoloe-26l-seg-pf.pt"))

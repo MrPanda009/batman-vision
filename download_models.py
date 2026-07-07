@@ -4,15 +4,12 @@ import urllib.request
 
 # Configuration
 MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-EMBEDDINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "embeddings")
 RELEASE_URL = "https://github.com/ultralytics/assets/releases/download/v8.4.0"
 
 MODELS = [
     "yoloe-11s-seg-pf.pt",
     "yoloe-26s-seg-pf.pt",
-    "yoloe-26s-seg.pt",
-    "mobileclip_blt.ts",
-    "mobileclip2_b.ts",
+    "yoloe-26l-seg-pf.pt",
 ]
 
 def download_file(url, dest_path):
@@ -62,7 +59,6 @@ def download_file(url, dest_path):
 
 def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
-    os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
     
     print("=========================================")
     print("  Batman-Vision Models Downloader        ")
