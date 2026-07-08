@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import collections
+import queue
 import cv2
 import torch
 import numpy as np
@@ -164,6 +165,12 @@ def main():
     # In-memory buffer keyed by track ID
     track_buffers = {}
 
+    # Simple in-memory queue for finalized accepted tracks
+    finalized_queue = queue.Queue()
+
+    # Dictionary to store active track metadata: track_id -> {first_seen, last_seen, class_counts}
+    track_metadata = {}
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -222,6 +229,17 @@ def main():
                     track_id = track_ids[i]
                     current_tracks[track_id] = class_name
                     label_text = f"ID {track_id} | {class_name} {conf:.2f}"
+                    
+                    # Update track metadata
+                    if track_id not in track_metadata:
+                        track_metadata[track_id] = {
+                            'first_seen': curr_time,
+                            'last_seen': curr_time,
+                            'class_counts': collections.Counter({class_name: 1})
+                        }
+                    else:
+                        track_metadata[track_id]['last_seen'] = curr_time
+                        track_metadata[track_id]['class_counts'][class_name] += 1
                     
                     # Ensure track has a buffer
                     if track_id not in track_buffers:
@@ -304,6 +322,49 @@ def main():
             if buffer_summary:
                 print(f"[BUFFER STATUS] { ' | '.join(buffer_summary) }")
 
+        # Check for finalized tracks (not matched in any frame for 1.5 seconds)
+        finalized_ids = []
+        for tid, meta in track_metadata.items():
+            if curr_time - meta['last_seen'] > 1.5:
+                finalized_ids.append(tid)
+                
+        for tid in finalized_ids:
+            meta = track_metadata[tid]
+            first_seen = meta['first_seen']
+            last_seen = meta['last_seen']
+            total_tracked_time = last_seen - first_seen
+            class_name_guess = meta['class_counts'].most_common(1)[0][0]
+            
+            buf = track_buffers.get(tid)
+            crops = buf.crops if buf else []
+            num_crops = len(crops)
+            
+            if total_tracked_time >= 1.0 and num_crops >= 2:
+                print(f"[TRACK LIFECYCLE] Track {tid} ({class_name_guess}) finalized: ACCEPTED. "
+                      f"Tracked time: {total_tracked_time:.2f}s, Crops: {num_crops}")
+                finalized_queue.put({
+                    'track_id': tid,
+                    'class_name_guess': class_name_guess,
+                    'crops': crops,
+                    'first_seen': first_seen,
+                    'last_seen': last_seen
+                })
+            else:
+                reason_parts = []
+                if total_tracked_time < 1.0:
+                    reason_parts.append(f"tracked time {total_tracked_time:.2f}s < 1.0s")
+                if num_crops < 2:
+                    reason_parts.append(f"crops count {num_crops} < 2")
+                reason_str = " & ".join(reason_parts)
+                print(f"[TRACK LIFECYCLE] Track {tid} ({class_name_guess}) finalized: DISCARDED as noise ({reason_str}). "
+                      f"Tracked time: {total_tracked_time:.2f}s, Crops: {num_crops}")
+            
+            # Clean up
+            if tid in track_metadata:
+                del track_metadata[tid]
+            if tid in track_buffers:
+                del track_buffers[tid]
+
         # Calculate Running FPS (averaged over the last 30 frames)
         fps = len(frame_times) / sum(frame_times) if frame_times else 0.0
         fps_text = f"FPS: {fps:.1f}"
@@ -334,9 +395,53 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    # Finalize any remaining tracks at exit
+    if track_metadata:
+        print(f"\n[TRACK LIFECYCLE] Finalizing remaining {len(track_metadata)} tracks on exit...")
+        for tid in list(track_metadata.keys()):
+            meta = track_metadata[tid]
+            first_seen = meta['first_seen']
+            last_seen = meta['last_seen']
+            total_tracked_time = last_seen - first_seen
+            class_name_guess = meta['class_counts'].most_common(1)[0][0]
+            
+            buf = track_buffers.get(tid)
+            crops = buf.crops if buf else []
+            num_crops = len(crops)
+            
+            if total_tracked_time >= 1.0 and num_crops >= 2:
+                print(f"[TRACK LIFECYCLE] Track {tid} ({class_name_guess}) finalized (exit): ACCEPTED. "
+                      f"Tracked time: {total_tracked_time:.2f}s, Crops: {num_crops}")
+                finalized_queue.put({
+                    'track_id': tid,
+                    'class_name_guess': class_name_guess,
+                    'crops': crops,
+                    'first_seen': first_seen,
+                    'last_seen': last_seen
+                })
+            else:
+                reason_parts = []
+                if total_tracked_time < 1.0:
+                    reason_parts.append(f"tracked time {total_tracked_time:.2f}s < 1.0s")
+                if num_crops < 2:
+                    reason_parts.append(f"crops count {num_crops} < 2")
+                reason_str = " & ".join(reason_parts)
+                print(f"[TRACK LIFECYCLE] Track {tid} ({class_name_guess}) finalized (exit): DISCARDED as noise ({reason_str}). "
+                      f"Tracked time: {total_tracked_time:.2f}s, Crops: {num_crops}")
+
     cap.release()
     cv2.destroyAllWindows()
     print("Inference loop finished. Webcam released.")
+
+    # Print the final queued items for verification
+    if not finalized_queue.empty():
+        print(f"\n--- Final Queue Contents (Total: {finalized_queue.qsize()}) ---")
+        while not finalized_queue.empty():
+            item = finalized_queue.get()
+            crops_info = [f"[Crop score: {c['score']:.2f}, bbox: {c['bbox']}]" for c in item['crops']]
+            print(f"  - Track ID: {item['track_id']}, Class: {item['class_name_guess']}, "
+                  f"First seen: {item['first_seen']:.2f}, Last seen: {item['last_seen']:.2f}, "
+                  f"Crops: {len(item['crops'])} metadata: {crops_info}")
 
 if __name__ == "__main__":
     main()
