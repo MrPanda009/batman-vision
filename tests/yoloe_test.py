@@ -21,6 +21,104 @@ def draw_semi_transparent_rect(img, pt1, pt2, color, alpha):
         rect = np.full(sub_img.shape, color, dtype=np.uint8)
         img[y1:y2, x1:x2] = cv2.addWeighted(sub_img, 1 - alpha, rect, alpha, 0)
 
+# Threshold constants for crop filtering
+MIN_SHARPNESS = 50.0   # Minimum Laplacian variance for a crop to be considered sharp
+MIN_BBOX_SIZE = 1600   # Minimum bounding box area in pixels (width * height)
+MIN_CONFIDENCE = 0.35  # Minimum detection confidence score
+
+# Weights for the combined quality score (weighted combination of confidence, size, and sharpness)
+WEIGHT_CONF = 1.0
+WEIGHT_SIZE = 1.0
+WEIGHT_SHARP = 1.0
+
+def compute_blur_score(crop):
+    """Compute the Laplacian variance as a sharpness/blur score.
+    Higher values mean sharper images, lower values mean blurrier images.
+    """
+    if crop is None or crop.size == 0:
+        return 0.0
+    try:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+def compute_iou(box1, box2):
+    """Compute Intersection over Union (IoU) of two bounding boxes.
+    Box format: [x1, y1, x2, y2]
+    """
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    
+    if union == 0:
+        return 0.0
+    return intersection / union
+
+def compute_combined_score(confidence, bbox_size, sharpness):
+    """Compute combined quality score using normalized scale weights."""
+    scaled_size = bbox_size / 10000.0
+    scaled_sharp = sharpness / 100.0
+    return (WEIGHT_CONF * confidence) + (WEIGHT_SIZE * scaled_size) + (WEIGHT_SHARP * scaled_sharp)
+
+class TrackBuffer:
+    def __init__(self, max_crops=6, iou_similarity_thresh=0.7):
+        self.max_crops = max_crops
+        self.iou_similarity_thresh = iou_similarity_thresh
+        # List of dicts: {'image': np.ndarray, 'bbox': list, 'confidence': float, 'sharpness': float, 'score': float}
+        self.crops = []
+
+    def add_crop(self, crop_img, bbox, confidence, sharpness, score):
+        """Attempts to add a crop to the buffer.
+        Returns:
+            bool: True if crop was added or replaced an existing crop, False otherwise.
+            str: Description of the action taken (e.g. 'added', 'replaced', 'rejected').
+        """
+        new_crop = {
+            'image': crop_img.copy(),
+            'bbox': list(bbox),
+            'confidence': confidence,
+            'sharpness': sharpness,
+            'score': score
+        }
+        
+        # Check if the new crop is spatially too similar to any existing crop in the buffer
+        similar_crop_idx = -1
+        for idx, crop in enumerate(self.crops):
+            if compute_iou(bbox, crop['bbox']) > self.iou_similarity_thresh:
+                similar_crop_idx = idx
+                break
+                
+        if similar_crop_idx != -1:
+            existing_crop = self.crops[similar_crop_idx]
+            if score > existing_crop['score']:
+                self.crops[similar_crop_idx] = new_crop
+                self.crops.sort(key=lambda x: x['score'], reverse=True)
+                return True, f"replaced similar crop (old score: {existing_crop['score']:.2f}, new score: {score:.2f})"
+            else:
+                return False, f"ignored (similar to existing with score {existing_crop['score']:.2f})"
+        
+        # If not spatially similar, check capacity
+        if len(self.crops) < self.max_crops:
+            self.crops.append(new_crop)
+            self.crops.sort(key=lambda x: x['score'], reverse=True)
+            return True, f"added (capacity: {len(self.crops)}/{self.max_crops})"
+        
+        # Buffer is full, check if it is better than the worst crop (last one)
+        worst_crop = self.crops[-1]
+        if score > worst_crop['score']:
+            self.crops[-1] = new_crop
+            self.crops.sort(key=lambda x: x['score'], reverse=True)
+            return True, f"evicted worst (score: {worst_crop['score']:.2f}) and replaced with new (score: {score:.2f})"
+            
+        return False, f"rejected (score {score:.2f} <= worst score {worst_crop['score']:.2f})"
+
 def main():
     print("Checking torch MPS availability...")
     mps_available = torch.backends.mps.is_available()
@@ -63,11 +161,17 @@ def main():
     # Dictionary to store active tracking IDs from the previous frame: track_id -> class_name
     active_tracks = {}
 
+    # In-memory buffer keyed by track ID
+    track_buffers = {}
+
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Error: Failed to read frame from webcam.")
             break
+
+        # Keep a clean copy of the frame for cropping (before overlays are drawn)
+        frame_clean = frame.copy()
 
         # Calculate time delta for instantaneous FPS and rolling FPS
         curr_time = time.perf_counter()
@@ -118,6 +222,34 @@ def main():
                     track_id = track_ids[i]
                     current_tracks[track_id] = class_name
                     label_text = f"ID {track_id} | {class_name} {conf:.2f}"
+                    
+                    # Ensure track has a buffer
+                    if track_id not in track_buffers:
+                        track_buffers[track_id] = TrackBuffer()
+                    
+                    # Crop bbox safely from clean frame
+                    h, w = frame_clean.shape[:2]
+                    x1_c, y1_c = max(0, x1), max(0, y1)
+                    x2_c, y2_c = min(w, x2), min(h, y2)
+                    
+                    if x2_c > x1_c and y2_c > y1_c:
+                        crop_img = frame_clean[y1_c:y2_c, x1_c:x2_c]
+                        bbox_size = (x2_c - x1_c) * (y2_c - y1_c)
+                        
+                        # Validate thresholds
+                        if conf < MIN_CONFIDENCE:
+                            pass
+                        elif bbox_size < MIN_BBOX_SIZE:
+                            pass
+                        else:
+                            sharpness = compute_blur_score(crop_img)
+                            if sharpness >= MIN_SHARPNESS:
+                                score = compute_combined_score(conf, bbox_size, sharpness)
+                                added, action_desc = track_buffers[track_id].add_crop(
+                                    crop_img, [x1_c, y1_c, x2_c, y2_c], conf, sharpness, score
+                                )
+                                print(f"[CROP BUFFER] Track {track_id} ({class_name}): {action_desc} | "
+                                      f"Conf: {conf:.2f}, Size: {bbox_size}px, Sharpness: {sharpness:.1f}, Combined Score: {score:.2f}")
                 else:
                     label_text = f"{class_name} {conf:.2f}"
                 
@@ -148,7 +280,7 @@ def main():
                     1,
                     cv2.LINE_AA
                 )
-
+ 
         # Log to the console whenever a track ID appears or disappears
         new_ids = set(current_tracks.keys()) - set(active_tracks.keys())
         disappeared_ids = set(active_tracks.keys()) - set(current_tracks.keys())
@@ -160,6 +292,17 @@ def main():
             print(f"[TRACKER] [FPS: {inst_fps:.1f}] Track ID disappeared: ID {tid} ({active_tracks[tid]})")
             
         active_tracks = current_tracks
+        
+        # Log active buffers status summary
+        if current_tracks:
+            buffer_summary = []
+            for tid in sorted(current_tracks.keys()):
+                buf = track_buffers.get(tid)
+                if buf:
+                    scores_str = ", ".join([f"{c['score']:.2f}" for c in buf.crops])
+                    buffer_summary.append(f"ID {tid}: {len(buf.crops)} crops [{scores_str}]")
+            if buffer_summary:
+                print(f"[BUFFER STATUS] { ' | '.join(buffer_summary) }")
 
         # Calculate Running FPS (averaged over the last 30 frames)
         fps = len(frame_times) / sum(frame_times) if frame_times else 0.0
