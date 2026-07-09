@@ -175,6 +175,10 @@ def main():
             base_url="https://invalid-dead-end-integrate.api.nvidia.com/v1",
             api_key="bad_key"
         )
+        bad_groq_client = OpenAI(
+            base_url="https://invalid-dead-end-integrate.api.groq.com/v1",
+            api_key="bad_key"
+        )
         
         while True:
             item = finalized_queue.get()
@@ -199,7 +203,7 @@ def main():
                 from yoloe_test import execute_tagging_with_retries
                 
                 # Mock a small call
-                execute_tagging_with_retries(bad_client, [{"role": "user", "content": "test"}])
+                execute_tagging_with_retries(bad_client, [{"role": "user", "content": "test"}], groq_client=bad_groq_client)
                 
             except Exception as e:
                 print(f"[WORKER ERROR] Permanent tagging failure for track {track_id}: {e}")

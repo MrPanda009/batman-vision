@@ -28,10 +28,11 @@ def cv2_to_base64_data_url(img):
     base64_str = base64.b64encode(buffer).decode('utf-8')
     return f"data:image/jpeg;base64,{base64_str}"
 
-def execute_tagging_with_retries(client, messages):
+def execute_tagging_with_retries(client, messages, groq_client=None):
     """Executes tagging. First tries nvidia/llama-3.1-nemotron-nano-vl-8b-v1 as the primary VLM.
-    Falls back to qwen/qwen3.5-397b-a17b.
-    As a third option, falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning.
+    Falls back to qwen/qwen3.5-397b-a17b (NVIDIA).
+    Falls back to qwen/qwen3.6-27b (Groq).
+    As a fourth option, falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning (NVIDIA).
     """
     def parse_response(content):
         if not content:
@@ -121,9 +122,44 @@ def execute_tagging_with_retries(client, messages):
         return result_data
         
     except Exception as err:
-        print(f"[WORKER] Fallback VLM 1 (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Trying Nemotron Reasoning...")
+        print(f"[WORKER] Fallback VLM 1 (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Trying Groq Qwen...")
 
-    # 3. Fallback VLM 2: Nemotron 3 Nano Omni (with reasoning, tenacity retries)
+    # 3. Fallback VLM 2: Groq Qwen 3.6 27b
+    if groq_client is None:
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        if groq_api_key:
+            groq_client = OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=groq_api_key
+            )
+
+    if groq_client is not None:
+        print("[WORKER] Invoking fallback VLM 2 (qwen/qwen3.6-27b via Groq)...")
+        try:
+            response = groq_client.chat.completions.create(
+                model="qwen/qwen3.6-27b",
+                messages=messages,
+                max_tokens=4096,
+                temperature=0.60,
+                top_p=0.95,
+                timeout=60.0
+            )
+            content = response.choices[0].message.content
+            result_data = parse_response(content)
+            
+            confidence = result_data.get("confidence", "low").lower()
+            if confidence == "low":
+                raise ValueError("Fallback VLM 2 (Groq Qwen) returned low confidence")
+                
+            print("[WORKER] Fallback VLM 2 (Groq Qwen) tagging successful.")
+            return result_data
+            
+        except Exception as err:
+            print(f"[WORKER] Fallback VLM 2 (qwen/qwen3.6-27b via Groq) failed or timed out: {err}. Trying Nemotron Reasoning...")
+    else:
+        print("[WORKER] Skipping fallback VLM 2 (Groq Qwen) because GROQ_API_KEY is not set. Trying Nemotron Reasoning...")
+
+    # 4. Fallback VLM 3: Nemotron 3 Nano Omni (with reasoning, tenacity retries)
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -148,7 +184,7 @@ def execute_tagging_with_retries(client, messages):
             timeout=180.0
         )
 
-    print("[WORKER] Invoking fallback VLM 2 (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning)...")
+    print("[WORKER] Invoking fallback VLM 3 (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning)...")
     for attempt in range(1, 3):
         try:
             response = call_fallback_api()
@@ -158,17 +194,17 @@ def execute_tagging_with_retries(client, messages):
             confidence = result_data.get("confidence", "low").lower()
             if confidence == "low":
                 if attempt < 2:
-                    print(f"[WORKER] Fallback VLM 2 returned low confidence on attempt 1. Retrying once...")
+                    print(f"[WORKER] Fallback VLM 3 returned low confidence on attempt 1. Retrying once...")
                     continue
                 else:
-                    raise ValueError("Low confidence response from fallback VLM 2 after retry")
+                    raise ValueError("Low confidence response from fallback VLM 3 after retry")
                     
-            print("[WORKER] Fallback VLM 2 (Nemotron Reasoning) tagging successful.")
+            print("[WORKER] Fallback VLM 3 (Nemotron Reasoning) tagging successful.")
             return result_data
             
         except ValueError as e:
             if attempt < 2:
-                print(f"[WORKER] Fallback VLM 2 attempt 1 failed with value error: {e}. Retrying once...")
+                print(f"[WORKER] Fallback VLM 3 attempt 1 failed with value error: {e}. Retrying once...")
                 continue
             else:
                 raise e
@@ -192,6 +228,17 @@ def tagging_worker_func(finalized_queue, model_path):
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=api_key or "missing_key"
     )
+
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if not groq_api_key:
+        print("[WORKER] WARNING: GROQ_API_KEY environment variable is not set. Groq fallback will be bypassed.")
+
+    groq_client = None
+    if groq_api_key:
+        groq_client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_api_key
+        )
     
     while True:
         item = finalized_queue.get()
@@ -309,7 +356,7 @@ def tagging_worker_func(finalized_queue, model_path):
             ]
             
             # Call API with retry logic
-            result = execute_tagging_with_retries(client, messages)
+            result = execute_tagging_with_retries(client, messages, groq_client=groq_client)
             
             # Write back result (pending -> tagged), and store embedding once tagging succeeds
             db.update_object_result(
