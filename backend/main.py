@@ -65,7 +65,7 @@ def is_pipeline_active():
 # Threshold constants for crop filtering
 MIN_SHARPNESS = 50.0   # Minimum Laplacian variance for a crop to be considered sharp
 MIN_BBOX_SIZE = 1600   # Minimum bounding box area in pixels (width * height)
-MIN_CONFIDENCE = 0.35  # Minimum detection confidence score
+MIN_CONFIDENCE = 0.25  # Minimum detection confidence score
 DEDUP_SIMILARITY_THRESHOLD = 0.9  # Threshold above which an object is considered a re-sighting
 
 # Weights for the combined quality score (weighted combination of confidence, size, and sharpness)
