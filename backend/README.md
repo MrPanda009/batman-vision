@@ -1,10 +1,16 @@
-# Batman-Vision
+# Batman-Vision (backend)
 
 A real-time webcam object detection and tracking prototype built on [Ultralytics YOLOE](https://github.com/ultralytics/ultralytics). It tracks objects across frames, buffers the best-quality crops per track, and hands off "finalized" tracks to a background worker that de-duplicates against previously seen objects (via YOLOE embeddings) and tags new ones using a vision-language model (VLM) for object name, descriptive tags, and OCR text. Results are persisted to SQLite with full-text search.
+
+The pipeline exists in two forms sharing the same logic:
+
+- **`main.py`** — a FastAPI server exposing the pipeline over HTTP (start/stop, MJPEG HUD stream, object/stats JSON), consumed by the `../frontend` Next.js dashboard. This is the intended way to run the system day-to-day.
+- **`tests/yoloe_test.py`** — the original standalone script with a local OpenCV display window, useful for quick iteration without the frontend.
 
 ## Contents
 
 - [System overview](#system-overview)
+- [FastAPI server & HTTP API](#fastapi-server--http-api)
 - [Live tracking loop](#live-tracking-loop)
 - [Crop buffering & quality scoring](#crop-buffering--quality-scoring)
 - [Track lifecycle](#track-lifecycle)
@@ -53,9 +59,32 @@ Two threads make up the running system:
 1. **Main thread** owns the webcam, runs detection/tracking every frame, buffers crops per track, and decides when a track's life is over.
 2. **Worker thread** consumes finalized tracks off an in-memory `queue.Queue`, does embedding-based de-duplication, and calls out to a VLM to tag genuinely new objects. The two threads only communicate through `finalized_queue` and the shared SQLite database.
 
+## FastAPI server & HTTP API
+
+`main.py` runs the tagging worker thread continuously (started once at import time) and runs the capture/tracking loop (`capture_loop_func`) as an on-demand thread controlled via HTTP:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/pipeline/start` | POST | Starts the webcam capture + tracking thread. No-op if already running. |
+| `/pipeline/stop` | POST | Stops the capture thread and releases the webcam. |
+| `/pipeline/status` | GET | `{"active": bool}` — whether the capture thread is alive. |
+| `/video_feed` | GET | MJPEG stream (`multipart/x-mixed-replace`) of the latest HUD-annotated frame; serves a static "Pipeline Stopped" placeholder when idle. |
+| `/api/objects` | GET | All rows from the `objects` table, most recent (`last_seen`) first. |
+| `/api/stats` | GET | Counts of `pending` / `tagged` / `failed` objects. |
+| `/api/clear` | POST | Deletes all `objects` rows and crop files in `captures/`. Returns 400 if the pipeline is currently active. |
+| `/captures/*` | GET | Static file mount serving crop JPEGs by relative path. |
+
+CORS is restricted to `http://localhost:3000` / `http://127.0.0.1:3000` (the Next.js dev server) — update `CORSMiddleware` in `main.py` if the frontend origin changes. On server shutdown, the capture thread is signalled to stop and joined, then the tagging worker is stopped by pushing `None` onto `finalized_queue`.
+
+Run it with:
+
+```bash
+uvicorn main:app --reload
+```
+
 ## Live tracking loop
 
-Implemented in `tests/yoloe_test.py::main()`.
+The core detection/tracking logic below is implemented twice: as `tests/yoloe_test.py::main()` (standalone, OpenCV window) and as `main.py::capture_loop_func()` (threaded, feeds the HTTP API instead of drawing a window). Both use the same thresholds, `TrackBuffer`, and lifecycle rules described in this section.
 
 ```mermaid
 sequenceDiagram
@@ -143,17 +172,19 @@ flowchart TD
     E -->|yes| F["update_object_re_sighting()\nappend crops, bump last_seen\nNO VLM call"]
     E -->|no| G["insert_pending_object()\nstatus: none -> pending"]
     G --> H["Build VLM request:\nsystem-style prompt + all crops as\nbase64 image_url blocks"]
-    H --> I["Call qwen/qwen3.5-397b-a17b\n(primary VLM, 60s timeout)"]
+    H --> I["Call qwen/qwen3.5-397b-a17b\n(primary VLM, 15s timeout)"]
     I -->|success, confidence != low| J["update_object_result()\nstatus: pending -> tagged\n+ store embedding"]
-    I -->|failure / timeout / low confidence| K["Fallback: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning\n(tenacity retries: 3x, exp. backoff)\n180s timeout"]
+    I -->|failure / timeout / low confidence| K["Fallback 1: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning\n(reasoning enabled, 15s timeout)"]
     K -->|success| J
-    K -->|exhausted retries / low confidence twice| L["update_object_result()\nstatus: pending -> failed"]
+    K -->|failure / timeout| M["Fallback 2: nvidia/llama-3.1-nemotron-nano-vl-8b-v1\n(tenacity retries: 3x, exp. backoff\n+ 1 manual retry, 20s timeout)"]
+    M -->|success| J
+    M -->|exhausted retries| L["update_object_result()\nstatus: pending -> failed"]
 ```
 
 Notes:
 - The VLM is expected to return strict JSON: `object_name`, `tags` (array), `ocr_text`, `confidence` (`high`/`medium`/`low`). Markdown code-fences around the JSON are stripped defensively before parsing.
-- Retries only apply to the fallback model, and only for connection/timeout/rate-limit/server errors (`tenacity`); a second "low confidence" result from the fallback is treated as a permanent failure, not retried further.
-- Both API calls go through NVIDIA's OpenAI-compatible endpoint (`https://integrate.api.nvidia.com/v1`), authenticated via `NVIDIA_API_KEY`.
+- Three-level fallback chain: Qwen (primary) → Nemotron Reasoning → Llama-3.1-Nemotron-Nano-VL (fast, reliable last resort). All timeouts are short (15-20s) so one stuck call doesn't stall the worker thread for long. `tenacity` retries (connection/timeout/rate-limit/server errors) plus one manual retry apply only to the third-level Llama-VL call; a failure at that stage is treated as permanent.
+- All API calls go through NVIDIA's OpenAI-compatible endpoint (`https://integrate.api.nvidia.com/v1`), authenticated via `NVIDIA_API_KEY`.
 - Status is always `None -> pending -> {tagged, failed}` — a track is never re-tagged once it lands in a terminal state (`tagged`/`failed`), except via the de-duplication path, which updates an existing `tagged` row directly.
 
 ## Database schema
@@ -198,17 +229,20 @@ erDiagram
 
 ```
 .
+├── main.py                    # FastAPI server: HTTP API + threaded pipeline (frontend talks to this)
+├── recall.py                  # Standalone CLI: NL query -> keywords -> FTS5 search over tagged objects
 ├── db.py                      # SQLite persistence layer (schema, CRUD, FTS5 search)
 ├── download_models.py         # Stdlib-only script to fetch YOLOE weights
 ├── models/                    # Downloaded YOLOE checkpoints (gitignored)
 ├── embeddings/                # Cached YOLOE embeddings (gitignored)
-├── captures/                  # Saved crop JPEGs (gitignored)
+├── captures/                  # Saved crop JPEGs (gitignored), served at /captures by main.py
 ├── objects.db                 # Runtime SQLite database (gitignored)
 ├── .env                       # NVIDIA_API_KEY (gitignored)
 └── tests/
-    ├── yoloe_test.py           # Main live application: tracking loop + tagging worker
+    ├── yoloe_test.py           # Standalone live application: tracking loop + tagging worker, OpenCV window
     ├── custom_bytetrack.yaml   # Tuned ByteTrack tracker config
     ├── smoke_test.py           # Webcam + MPS availability check
+    ├── seed_recall_db.py       # Seeds an isolated test DB with fake tagged objects, for exercising recall.py
     ├── test_db.py              # Unit tests for db.py
     └── test_tagging_worker.py  # End-to-end manual test of the tagging worker (live API calls)
 ```
@@ -219,7 +253,7 @@ erDiagram
 python3 -m venv .venv
 source .venv/bin/activate
 # install dependencies as needed (no requirements.txt is checked in yet):
-# ultralytics, opencv-python, torch/torchvision, openai, tenacity, python-dotenv, numpy
+# ultralytics, opencv-python, torch/torchvision, openai, tenacity, python-dotenv, numpy, fastapi, uvicorn
 
 python download_models.py   # fetches yoloe-{11s,26s,26l}-seg-pf.pt into models/
 ```
@@ -234,7 +268,10 @@ NVIDIA_API_KEY=your-key-here
 
 | Command | What it does |
 |---|---|
+| `uvicorn main:app --reload` | Starts the FastAPI server (HTTP API, MJPEG stream, threaded pipeline). This is what `../frontend` talks to; see [FastAPI server & HTTP API](#fastapi-server--http-api). |
 | `python tests/smoke_test.py` | Verifies MPS availability and webcam access. Interactive, quit with `q`. |
-| `python tests/yoloe_test.py` | Runs the full live application: tracking + HUD overlay + background tagging worker. Interactive, quit with `q`. |
+| `python tests/yoloe_test.py` | Runs the standalone live application: tracking + HUD overlay + background tagging worker, in an OpenCV window. Interactive, quit with `q`. |
+| `python recall.py "<query>"` | Extracts search keywords from a natural-language query via NVIDIA API and searches tagged objects (FTS5). Requires `NVIDIA_API_KEY`. |
 | `python tests/test_db.py` | Unit tests for `db.py` against an isolated test database. |
 | `python tests/test_tagging_worker.py` | End-to-end test of the tagging worker against synthetic crops, including a live NVIDIA API call and a simulated network-failure case. **Makes real API calls** — requires `NVIDIA_API_KEY` and a downloaded model. |
+| `python tests/seed_recall_db.py` | Seeds an isolated test database with fake tagged objects, useful for trying `recall.py` without running the live pipeline. |
