@@ -172,18 +172,18 @@ flowchart TD
     E -->|yes| F["update_object_re_sighting()\nappend crops, bump last_seen\nNO VLM call"]
     E -->|no| G["insert_pending_object()\nstatus: none -> pending"]
     G --> H["Build VLM request:\nsystem-style prompt + all crops as\nbase64 image_url blocks"]
-    H --> I["Call qwen/qwen3.5-397b-a17b\n(primary VLM, 15s timeout)"]
+    H --> I["Call nvidia/llama-3.1-nemotron-nano-vl-8b-v1\n(primary VLM, 20s timeout,\ntenacity retries: 3x, exp. backoff\n+ 1 manual retry)"]
     I -->|success, confidence != low| J["update_object_result()\nstatus: pending -> tagged\n+ store embedding"]
-    I -->|failure / timeout / low confidence| K["Fallback 1: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning\n(reasoning enabled, 15s timeout)"]
-    K -->|success| J
-    K -->|failure / timeout| M["Fallback 2: nvidia/llama-3.1-nemotron-nano-vl-8b-v1\n(tenacity retries: 3x, exp. backoff\n+ 1 manual retry, 20s timeout)"]
+    I -->|failure / timeout / low confidence| K["Fallback 1: qwen/qwen3.5-397b-a17b\n(15s/60s timeout)"]
+    K -->|success, confidence != low| J
+    K -->|failure / timeout / low confidence| M["Fallback 2: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning\n(reasoning enabled, 15s/180s timeout)"]
     M -->|success| J
-    M -->|exhausted retries| L["update_object_result()\nstatus: pending -> failed"]
+    M -->|failure / timeout| L["update_object_result()\nstatus: pending -> failed"]
 ```
 
 Notes:
 - The VLM is expected to return strict JSON: `object_name`, `tags` (array), `ocr_text`, `confidence` (`high`/`medium`/`low`). Markdown code-fences around the JSON are stripped defensively before parsing.
-- Three-level fallback chain: Qwen (primary) → Nemotron Reasoning → Llama-3.1-Nemotron-Nano-VL (fast, reliable last resort). All timeouts are short (15-20s) so one stuck call doesn't stall the worker thread for long. `tenacity` retries (connection/timeout/rate-limit/server errors) plus one manual retry apply only to the third-level Llama-VL call; a failure at that stage is treated as permanent.
+- Three-level fallback chain: Llama-3.1-Nemotron-Nano-VL (primary) → Qwen → Nemotron Reasoning. Timeouts are kept short (15-20s on main.py) so one stuck call doesn't stall the worker thread for long. Tenacity retries (connection/timeout/rate-limit/server errors) plus one manual retry apply to the primary Llama-VL call and to the final Nemotron fallback when run in the offline test suite.
 - All API calls go through NVIDIA's OpenAI-compatible endpoint (`https://integrate.api.nvidia.com/v1`), authenticated via `NVIDIA_API_KEY`.
 - Status is always `None -> pending -> {tagged, failed}` — a track is never re-tagged once it lands in a terminal state (`tagged`/`failed`), except via the de-duplication path, which updates an existing `tagged` row directly.
 

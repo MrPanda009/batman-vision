@@ -62,10 +62,10 @@ There is no mocking of the VLM API in tests — `test_tagging_worker.py` hits th
    - Computes a YOLOE embedding (CPU) for the best crop.
    - De-duplication: cosine-similarity-compares against embeddings of all `status='tagged'` DB rows; if similarity ≥ `DEDUP_SIMILARITY_THRESHOLD` (0.9), treats it as a re-sighting (`db.update_object_re_sighting`) and skips the VLM call entirely.
    - Otherwise inserts a `pending` row, then calls the VLM (`execute_tagging_with_retries`) with all buffered crops as base64 image blocks, expecting strict JSON (`object_name`, `tags`, `ocr_text`, `confidence`).
-   - Three-level VLM fallback chain, all with fast 15-20s timeouts so a stuck call doesn't stall the worker thread for long:
-     1. `qwen/qwen3.5-397b-a17b` (primary) — 15s timeout; treated as failed if it returns `confidence: "low"`.
-     2. `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` (reasoning fallback) — 15s timeout, reasoning enabled.
-     3. `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` (fast VL fallback) — 20s timeout, wrapped in its own `tenacity` retry (3 attempts, exponential backoff) for connection/timeout/rate-limit/server errors, plus one manual retry.
+   - Three-level VLM fallback chain:
+     1. `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` (primary VL) — 20s timeout, wrapped in its own `tenacity` retry (3 attempts, exponential backoff) for connection/timeout/rate-limit/server errors, plus one manual retry. Treated as failed if it returns `confidence: "low"`.
+     2. `qwen/qwen3.5-397b-a17b` (first fallback) — 15s/60s timeout; treated as failed if it returns `confidence: "low"`.
+     3. `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` (reasoning fallback) — 15s/180s timeout, reasoning enabled.
    - On success: `db.update_object_result(..., status='tagged', embedding=...)`. On any exception (all three VLMs exhausted): `status='failed'`.
    - Status transitions are always `None -> pending -> {tagged, failed}`, logged to console at each step.
 

@@ -80,9 +80,9 @@ def cv2_to_base64_data_url(img):
     return f"data:image/jpeg;base64,{base64_str}"
 
 def execute_tagging_with_retries(client, messages):
-    """Executes tagging. First tries qwen/qwen3.5-397b-a17b as the primary VLM.
-    Falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning.
-    As a third option, falls back to nvidia/llama-3.1-nemotron-nano-vl-8b-v1.
+    """Executes tagging. First tries nvidia/llama-3.1-nemotron-nano-vl-8b-v1 as the primary VLM.
+    Falls back to qwen/qwen3.5-397b-a17b.
+    As a third option, falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning.
     """
     def parse_response(content):
         if not content:
@@ -101,58 +101,8 @@ def execute_tagging_with_retries(client, messages):
             raise KeyError("Missing required keys ('object_name', 'tags') in API response JSON")
         return result_data
 
-    # 1. Attempt Primary VLM: Qwen 3.5 397B
-    print("[WORKER] Invoking primary VLM (qwen/qwen3.5-397b-a17b)...")
-    try:
-        response = client.chat.completions.create(
-            model="qwen/qwen3.5-397b-a17b",
-            messages=messages,
-            max_tokens=16384,
-            temperature=0.60,
-            top_p=0.95,
-            presence_penalty=0,
-            extra_body={
-                "top_k": 20,
-                "repetition_penalty": 1
-            },
-            timeout=15.0  # Fail fast if API hangs
-        )
-        content = response.choices[0].message.content
-        result_data = parse_response(content)
-        
-        confidence = result_data.get("confidence", "low").lower()
-        if confidence == "low":
-            raise ValueError("Primary VLM returned low confidence")
-            
-        print("[WORKER] Primary VLM (Qwen) tagging successful.")
-        return result_data
-        
-    except Exception as err:
-        print(f"[WORKER] Primary VLM (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Trying Nemotron Reasoning...")
-
-    # 2. Fallback VLM: Nemotron 3 Nano Omni (with reasoning)
-    print("[WORKER] Invoking fallback VLM (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning)...")
-    try:
-        response = client.chat.completions.create(
-            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-            messages=messages,
-            temperature=0.6,
-            top_p=0.95,
-            max_tokens=16384,
-            extra_body={"chat_template_kwargs":{"enable_thinking":True},"reasoning_budget":4096},
-            timeout=15.0  # Fail fast if API hangs
-        )
-        content = response.choices[0].message.content
-        result_data = parse_response(content)
-        
-        print("[WORKER] Fallback VLM (Nemotron Reasoning) tagging successful.")
-        return result_data
-        
-    except Exception as err:
-        print(f"[WORKER] Fallback VLM (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning) failed or timed out: {err}. Trying Llama-VL...")
-
-    # 3. Third-level Fallback: Llama 3.1 Nemotron Nano VL (Extremely fast, reliable Vision model)
-    print("[WORKER] Invoking second fallback VLM (nvidia/llama-3.1-nemotron-nano-vl-8b-v1)...")
+    # 1. Attempt Primary VLM: Llama 3.1 Nemotron Nano VL (Extremely fast, reliable Vision model)
+    print("[WORKER] Invoking primary VLM (nvidia/llama-3.1-nemotron-nano-vl-8b-v1)...")
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=4),
@@ -181,13 +131,70 @@ def execute_tagging_with_retries(client, messages):
             response = call_llama_vl()
             content = response.choices[0].message.content
             result_data = parse_response(content)
+            
+            confidence = result_data.get("confidence", "low").lower()
+            if confidence == "low":
+                raise ValueError("Primary VLM (Llama-VL) returned low confidence")
+                
+            print("[WORKER] Primary VLM (Llama-VL) tagging successful.")
             return result_data
         except Exception as e:
             if attempt < 2:
-                print(f"[WORKER] Llama-VL attempt {attempt} failed: {e}. Retrying once...")
+                print(f"[WORKER] Llama-VL attempt {attempt} failed or returned low confidence: {e}. Retrying once...")
                 continue
             else:
-                raise e
+                print(f"[WORKER] Primary VLM (nvidia/llama-3.1-nemotron-nano-vl-8b-v1) failed or timed out: {e}. Trying Qwen...")
+
+    # 2. Fallback VLM 1: Qwen 3.5 397B
+    print("[WORKER] Invoking fallback VLM 1 (qwen/qwen3.5-397b-a17b)...")
+    try:
+        response = client.chat.completions.create(
+            model="qwen/qwen3.5-397b-a17b",
+            messages=messages,
+            max_tokens=16384,
+            temperature=0.60,
+            top_p=0.95,
+            presence_penalty=0,
+            extra_body={
+                "top_k": 20,
+                "repetition_penalty": 1
+            },
+            timeout=15.0  # Fail fast if API hangs
+        )
+        content = response.choices[0].message.content
+        result_data = parse_response(content)
+        
+        confidence = result_data.get("confidence", "low").lower()
+        if confidence == "low":
+            raise ValueError("Fallback VLM 1 (Qwen) returned low confidence")
+            
+        print("[WORKER] Fallback VLM 1 (Qwen) tagging successful.")
+        return result_data
+        
+    except Exception as err:
+        print(f"[WORKER] Fallback VLM 1 (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Trying Nemotron Reasoning...")
+
+    # 3. Fallback VLM 2: Nemotron 3 Nano Omni (with reasoning)
+    print("[WORKER] Invoking fallback VLM 2 (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning)...")
+    try:
+        response = client.chat.completions.create(
+            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            messages=messages,
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=16384,
+            extra_body={"chat_template_kwargs":{"enable_thinking":True},"reasoning_budget":4096},
+            timeout=15.0  # Fail fast if API hangs
+        )
+        content = response.choices[0].message.content
+        result_data = parse_response(content)
+        
+        print("[WORKER] Fallback VLM 2 (Nemotron Reasoning) tagging successful.")
+        return result_data
+        
+    except Exception as err:
+        print(f"[WORKER] All VLMs failed or timed out. Final error: {err}")
+        raise err
 
 def tagging_worker_func(finalized_queue, model_path):
     """Background worker thread function.
