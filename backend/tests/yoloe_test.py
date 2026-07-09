@@ -510,11 +510,27 @@ def main():
         print("SUCCESS: MPS is available.")
         device = "mps"
 
-    print("Loading prompt-free YOLOE model (yoloe-26l-seg-pf.pt)...")
+    print("Loading prompt-based YOLOE model (yoloe-26l-seg.pt)...")
     # Load the YOLOE checkpoint using path relative to this script
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.abspath(os.path.join(script_dir, "../models/yoloe-26l-seg-pf.pt"))
+    model_path = os.path.abspath(os.path.join(script_dir, "../models/yoloe-26l-seg.pt"))
+    
+    # Configure weights_dir in ultralytics to search/download in models/
+    from ultralytics.utils import SETTINGS
+    SETTINGS.update({"weights_dir": os.path.dirname(model_path)})
+    
     model = YOLOE(model_path)
+    
+    # Configure custom classes
+    CUSTOM_CLASSES = [
+        "person", "bottle", "mobile phone", "laptop", "keyboard",
+        "mouse", "cup", "book", "backpack", "chair",
+        "monitor", "remote", "headphones", "pen", "wallet",
+        "watch", "glasses", "charger", "cable", "box"
+    ]
+    print(f"Setting custom vocabulary for YOLOE: {CUSTOM_CLASSES}")
+    model.set_classes(CUSTOM_CLASSES, model.get_text_pe(CUSTOM_CLASSES))
+    
     print(f"Model loaded successfully from {model_path}.")
     
     # Initialize SQLite database

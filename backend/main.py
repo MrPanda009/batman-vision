@@ -509,7 +509,7 @@ def capture_loop_func():
     device = "mps" if mps_available else "cpu"
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(script_dir, "models/yoloe-26l-seg-pf.pt")
+    model_path = os.path.join(script_dir, "models/yoloe-26l-seg.pt")
     tracker_path = os.path.join(script_dir, "tests/custom_bytetrack.yaml")
     
     if not os.path.exists(model_path):
@@ -518,7 +518,20 @@ def capture_loop_func():
         return
         
     try:
+        # Configure weights_dir in ultralytics to search/download in models/
+        from ultralytics.utils import SETTINGS
+        SETTINGS.update({"weights_dir": os.path.dirname(model_path)})
+        
         model = YOLOE(model_path)
+        # Configure custom classes
+        CUSTOM_CLASSES = [
+            "person", "bottle", "mobile phone", "laptop", "keyboard",
+            "mouse", "cup", "book", "backpack", "chair",
+            "monitor", "remote", "headphones", "pen", "wallet",
+            "watch", "glasses", "charger", "cable", "box"
+        ]
+        print(f"[PIPELINE] Setting custom vocabulary: {CUSTOM_CLASSES}")
+        model.set_classes(CUSTOM_CLASSES, model.get_text_pe(CUSTOM_CLASSES))
     except Exception as e:
         print(f"[PIPELINE ERROR] Failed to load YOLOE model: {e}")
         pipeline_active = False
@@ -752,7 +765,7 @@ def capture_loop_func():
 
 # Start continuous background worker
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, "models/yoloe-26l-seg-pf.pt")
+model_path = os.path.join(script_dir, "models/yoloe-26l-seg.pt")
 
 worker_thread = threading.Thread(
     target=tagging_worker_func,

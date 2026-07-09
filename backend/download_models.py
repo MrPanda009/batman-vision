@@ -10,6 +10,8 @@ MODELS = [
     "yoloe-11s-seg-pf.pt",
     "yoloe-26s-seg-pf.pt",
     "yoloe-26l-seg-pf.pt",
+    "yoloe-26s-seg.pt",
+    "yoloe-26l-seg.pt",
 ]
 
 def download_file(url, dest_path):
