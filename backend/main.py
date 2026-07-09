@@ -81,7 +81,8 @@ def cv2_to_base64_data_url(img):
 
 def execute_tagging_with_retries(client, messages):
     """Executes tagging. First tries qwen/qwen3.5-397b-a17b as the primary VLM.
-    Falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning upon failure or timeout.
+    Falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning.
+    As a third option, falls back to nvidia/llama-3.1-nemotron-nano-vl-8b-v1.
     """
     def parse_response(content):
         if not content:
@@ -114,7 +115,7 @@ def execute_tagging_with_retries(client, messages):
                 "top_k": 20,
                 "repetition_penalty": 1
             },
-            timeout=60.0
+            timeout=15.0  # Fail fast if API hangs
         )
         content = response.choices[0].message.content
         result_data = parse_response(content)
@@ -127,12 +128,34 @@ def execute_tagging_with_retries(client, messages):
         return result_data
         
     except Exception as err:
-        print(f"[WORKER] Primary VLM (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Falling back to Nemotron...")
+        print(f"[WORKER] Primary VLM (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Trying Nemotron Reasoning...")
 
-    # 2. Fallback VLM: Nemotron 3 Nano Omni (with tenacity retries)
+    # 2. Fallback VLM: Nemotron 3 Nano Omni (with reasoning)
+    print("[WORKER] Invoking fallback VLM (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning)...")
+    try:
+        response = client.chat.completions.create(
+            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            messages=messages,
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=16384,
+            extra_body={"chat_template_kwargs":{"enable_thinking":True},"reasoning_budget":4096},
+            timeout=15.0  # Fail fast if API hangs
+        )
+        content = response.choices[0].message.content
+        result_data = parse_response(content)
+        
+        print("[WORKER] Fallback VLM (Nemotron Reasoning) tagging successful.")
+        return result_data
+        
+    except Exception as err:
+        print(f"[WORKER] Fallback VLM (nvidia/nemotron-3-nano-omni-30b-a3b-reasoning) failed or timed out: {err}. Trying Llama-VL...")
+
+    # 3. Third-level Fallback: Llama 3.1 Nemotron Nano VL (Extremely fast, reliable Vision model)
+    print("[WORKER] Invoking second fallback VLM (nvidia/llama-3.1-nemotron-nano-vl-8b-v1)...")
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        wait=wait_exponential(multiplier=1, min=1, max=4),
         retry=retry_if_exception_type((
             openai.APIConnectionError,
             openai.APITimeoutError,
@@ -143,42 +166,28 @@ def execute_tagging_with_retries(client, messages):
         )),
         reraise=True
     )
-    def call_fallback_api():
+    def call_llama_vl():
         return client.chat.completions.create(
-            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            model="nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
             messages=messages,
-            temperature=0.6,
-            top_p=0.95,
-            max_tokens=65536,
-            extra_body={"chat_template_kwargs":{"enable_thinking":True},"reasoning_budget":16384},
-            timeout=180.0
+            temperature=0.4,
+            top_p=0.9,
+            max_tokens=4096,
+            timeout=20.0
         )
 
     for attempt in range(1, 3):
         try:
-            response = call_fallback_api()
+            response = call_llama_vl()
             content = response.choices[0].message.content
             result_data = parse_response(content)
-            
-            confidence = result_data.get("confidence", "low").lower()
-            if confidence == "low":
-                if attempt < 2:
-                    print(f"[WORKER] Fallback VLM returned low confidence on attempt 1. Retrying once...")
-                    continue
-                else:
-                    raise ValueError("Low confidence response from fallback VLM after retry")
-                    
             return result_data
-            
-        except ValueError as e:
+        except Exception as e:
             if attempt < 2:
-                print(f"[WORKER] Fallback attempt 1 failed with value error: {e}. Retrying once...")
+                print(f"[WORKER] Llama-VL attempt {attempt} failed: {e}. Retrying once...")
                 continue
             else:
                 raise e
-        except Exception as e:
-            # Fail immediately on API/network errors since tenacity already handled retries
-            raise e
 
 def tagging_worker_func(finalized_queue, model_path):
     """Background worker thread function.
