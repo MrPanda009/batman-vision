@@ -29,12 +29,58 @@ def cv2_to_base64_data_url(img):
     return f"data:image/jpeg;base64,{base64_str}"
 
 def execute_tagging_with_retries(client, messages):
-    """Executes the Nemotron-3-nano-omni-30b tagging API call.
-    Includes tenacity exponential backoff for network-level issues,
-    and a custom retry once for low confidence ('low') or JSON parsing failures.
+    """Executes tagging. First tries qwen/qwen3.5-397b-a17b as the primary VLM.
+    Falls back to nvidia/nemotron-3-nano-omni-30b-a3b-reasoning upon failure or timeout.
     """
+    def parse_response(content):
+        if not content:
+            raise ValueError("Received empty content from API")
+        content_clean = content.strip()
+        if content_clean.startswith("```json"):
+            content_clean = content_clean[7:]
+        elif content_clean.startswith("```"):
+            content_clean = content_clean[3:]
+        if content_clean.endswith("```"):
+            content_clean = content_clean[:-3]
+        content_clean = content_clean.strip()
+        
+        result_data = json.loads(content_clean)
+        if "object_name" not in result_data or "tags" not in result_data:
+            raise KeyError("Missing required keys ('object_name', 'tags') in API response JSON")
+        return result_data
+
+    # 1. Attempt Primary VLM: Qwen 3.5 397B
+    print("[WORKER] Invoking primary VLM (qwen/qwen3.5-397b-a17b)...")
+    try:
+        response = client.chat.completions.create(
+            model="qwen/qwen3.5-397b-a17b",
+            messages=messages,
+            max_tokens=16384,
+            temperature=0.60,
+            top_p=0.95,
+            presence_penalty=0,
+            extra_body={
+                "top_k": 20,
+                "repetition_penalty": 1
+            },
+            timeout=60.0
+        )
+        content = response.choices[0].message.content
+        result_data = parse_response(content)
+        
+        confidence = result_data.get("confidence", "low").lower()
+        if confidence == "low":
+            raise ValueError("Primary VLM returned low confidence")
+            
+        print("[WORKER] Primary VLM (Qwen) tagging successful.")
+        return result_data
+        
+    except Exception as err:
+        print(f"[WORKER] Primary VLM (qwen/qwen3.5-397b-a17b) failed or timed out: {err}. Falling back to Nemotron...")
+
+    # 2. Fallback VLM: Nemotron 3 Nano Omni (with tenacity retries)
     @retry(
-        stop=stop_after_attempt(5),
+        stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((
             openai.APIConnectionError,
@@ -46,52 +92,42 @@ def execute_tagging_with_retries(client, messages):
         )),
         reraise=True
     )
-    def call_api():
+    def call_fallback_api():
         return client.chat.completions.create(
             model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             messages=messages,
-            max_tokens=4096
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=65536,
+            extra_body={"chat_template_kwargs":{"enable_thinking":True},"reasoning_budget":16384},
+            timeout=180.0
         )
 
     for attempt in range(1, 3):
         try:
-            response = call_api()
+            response = call_fallback_api()
             content = response.choices[0].message.content
-            if not content:
-                raise ValueError("Received empty content from API")
-                
-            # Parse only content as JSON, cleaning markdown code block backticks if present
-            content_clean = content.strip()
-            if content_clean.startswith("```json"):
-                content_clean = content_clean[7:]
-            elif content_clean.startswith("```"):
-                content_clean = content_clean[3:]
-            if content_clean.endswith("```"):
-                content_clean = content_clean[:-3]
-            content_clean = content_clean.strip()
+            result_data = parse_response(content)
             
-            result_data = json.loads(content_clean)
-            
-            # Check for required JSON keys
-            if "object_name" not in result_data or "tags" not in result_data:
-                raise KeyError("Missing required keys ('object_name', 'tags') in API response JSON")
-                
             confidence = result_data.get("confidence", "low").lower()
             if confidence == "low":
                 if attempt < 2:
-                    print(f"[WORKER] API returned low confidence on attempt 1. Retrying once...")
+                    print(f"[WORKER] Fallback VLM returned low confidence on attempt 1. Retrying once...")
                     continue
                 else:
-                    raise ValueError("Low confidence response after retry")
+                    raise ValueError("Low confidence response from fallback VLM after retry")
                     
             return result_data
             
-        except Exception as e:
+        except ValueError as e:
             if attempt < 2:
-                print(f"[WORKER] Attempt 1 failed with: {e}. Retrying once...")
+                print(f"[WORKER] Fallback attempt 1 failed with value error: {e}. Retrying once...")
                 continue
             else:
                 raise e
+        except Exception as e:
+            # Fail immediately on API/network errors since tenacity already handled retries
+            raise e
 
 def tagging_worker_func(finalized_queue, model_path):
     """Background worker thread function.
@@ -123,12 +159,15 @@ def tagging_worker_func(finalized_queue, model_path):
         crops = item['crops']
         
         try:
-            # 1. Compute embedding for the new track
-            crop_imgs = [c['image'] for c in crops]
-            embs = embedding_model.embed(crop_imgs, device='cpu', verbose=False)
-            embs_tensor = torch.stack(embs)
-            mean_emb = torch.mean(embs_tensor, dim=0)
-            emb_np = mean_emb.numpy().astype(np.float32)
+            # 1. Compute embedding for the representative crop
+            # representative crop is crops[0]['image'] as crops are sorted descending by quality score
+            representative_crop = crops[0]['image'] if crops else None
+            if representative_crop is None:
+                raise ValueError("No crops available for track")
+                
+            embs = embedding_model.embed(representative_crop, device='cpu', verbose=False)
+            emb_tensor = embs[0]
+            emb_np = emb_tensor.numpy().astype(np.float32)
             emb_bytes = emb_np.tobytes()
             
             # Use max confidence of all crops as tracking confidence
@@ -142,7 +181,7 @@ def tagging_worker_func(finalized_queue, model_path):
             try:
                 with db.get_db_connection() as conn:
                     rows = conn.execute(
-                        "SELECT track_id, tags, ocr_text, embedding FROM objects WHERE status = 'tagged' AND embedding IS NOT NULL"
+                        "SELECT track_id, last_seen, crop_paths, tags, ocr_text, embedding FROM objects WHERE status = 'tagged' AND embedding IS NOT NULL"
                     ).fetchall()
                     
                 for row in rows:
@@ -158,47 +197,32 @@ def tagging_worker_func(finalized_queue, model_path):
                     if similarity > highest_similarity:
                         highest_similarity = similarity
                         best_match = row
-                        
-                if highest_similarity >= 0.85 and best_match is not None:
+                
+                # Check threshold
+                if highest_similarity >= DEDUP_SIMILARITY_THRESHOLD and best_match is not None:
                     is_duplicate = True
             except Exception as db_err:
                 print(f"[WORKER ERROR] Error querying database for de-duplication: {db_err}")
                 
+            # Log dedup decision to the console
+            if best_match is not None:
+                print(f"[DEDUP] Best match for track {track_id} is existing track {best_match['track_id']} with similarity {highest_similarity:.4f} (Threshold: {DEDUP_SIMILARITY_THRESHOLD})")
+            else:
+                print(f"[DEDUP] No match found for track {track_id} in database (Threshold: {DEDUP_SIMILARITY_THRESHOLD})")
+                
             if is_duplicate:
-                # Save crop paths to disk and insert pending row (None -> pending)
-                db.insert_pending_object(
-                    track_id=track_id,
-                    first_seen=first_seen,
-                    last_seen=last_seen,
-                    confidence=confidence,
-                    crops=crops,
-                    embedding=emb_bytes
-                )
-                print(f"[STATUS] Track {track_id} transition: None -> pending")
-                
-                # Deduplication console log
-                print(f"[DEDUP] Match found for track {track_id} with existing track {best_match['track_id']}, similarity score: {highest_similarity:.4f}")
-                
-                # Copy tags/ocr text from matched object
-                try:
-                    matched_tags = json.loads(best_match['tags']) if best_match['tags'] else []
-                except Exception:
-                    matched_tags = best_match['tags']
-                matched_ocr = best_match['ocr_text']
-                
-                # Update result (pending -> tagged)
-                db.update_object_result(track_id, matched_tags, matched_ocr, 'tagged')
-                print(f"[STATUS] Track {track_id} transition: pending -> tagged")
+                print(f"[DEDUP] Treat as re-sighting of existing track {best_match['track_id']}. Updating last_seen and crops.")
+                db.update_object_re_sighting(best_match['track_id'], last_seen, crops)
+                # No VLM API call!
                 continue
                 
-            # 3. If not duplicate, insert pending row (None -> pending)
+            # 3. If not duplicate, proceed with the normal pending-insert-and-tag flow
             db.insert_pending_object(
                 track_id=track_id,
                 first_seen=first_seen,
                 last_seen=last_seen,
                 confidence=confidence,
-                crops=crops,
-                embedding=emb_bytes
+                crops=crops
             )
             print(f"[STATUS] Track {track_id} transition: None -> pending")
             
@@ -240,12 +264,13 @@ def tagging_worker_func(finalized_queue, model_path):
             # Call API with retry logic
             result = execute_tagging_with_retries(client, messages)
             
-            # Write back result (pending -> tagged)
+            # Write back result (pending -> tagged), and store embedding once tagging succeeds
             db.update_object_result(
                 track_id=track_id,
                 tags=result['tags'],
                 ocr_text=result.get('ocr_text', ''),
-                status='tagged'
+                status='tagged',
+                embedding=emb_bytes
             )
             print(f"[STATUS] Track {track_id} transition: pending -> tagged")
             
@@ -283,6 +308,7 @@ def draw_semi_transparent_rect(img, pt1, pt2, color, alpha):
 MIN_SHARPNESS = 50.0   # Minimum Laplacian variance for a crop to be considered sharp
 MIN_BBOX_SIZE = 1600   # Minimum bounding box area in pixels (width * height)
 MIN_CONFIDENCE = 0.35  # Minimum detection confidence score
+DEDUP_SIMILARITY_THRESHOLD = 0.9  # Threshold above which an object is considered a re-sighting
 
 # Weights for the combined quality score (weighted combination of confidence, size, and sharpness)
 WEIGHT_CONF = 1.0

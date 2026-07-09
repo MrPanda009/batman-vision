@@ -1,5 +1,34 @@
-/.venv
-/models/
-/embeddings/
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Local environment variables and secrets
 .env
-/captures
+.env.local
+.env.*.local
+
+# Object storage directories (crops, downloaded weights, etc.)
+captures/
+models/
+embeddings/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/

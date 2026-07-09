@@ -85,20 +85,16 @@ def init_db():
         """)
         conn.commit()
 
-def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, captures_dir=None, embedding=None):
-    """Saves crops to disk under the captures directory and inserts a 'pending' object row.
+def save_crops_to_disk(track_id, crops, captures_dir=None):
+    """Saves crop images to disk and returns a list of their relative paths.
     
     Args:
-        track_id (int): Unique track identifier.
-        first_seen (float): Unix epoch timestamp of first detection.
-        last_seen (float): Unix epoch timestamp of last detection.
-        confidence (float): Bounding box / tracker confidence score.
+        track_id (int): Unique track identifier (used in filenames).
         crops (list): List of crop images (either numpy arrays, or dictionaries with 'image' key).
         captures_dir (str, optional): Custom path to captures directory.
-        embedding (bytes, optional): Serialized embedding bytes (BLOB) for the object.
         
     Returns:
-        str: JSON string of relative paths of saved crop files.
+        list: List of relative paths of saved crop files.
     """
     if captures_dir is None:
         captures_dir = CAPTURES_DIR
@@ -126,6 +122,24 @@ def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, ca
         rel_path = os.path.relpath(abs_path, project_root)
         crop_paths.append(rel_path)
         
+    return crop_paths
+
+def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, captures_dir=None, embedding=None):
+    """Saves crops to disk under the captures directory and inserts a 'pending' object row.
+    
+    Args:
+        track_id (int): Unique track identifier.
+        first_seen (float): Unix epoch timestamp of first detection.
+        last_seen (float): Unix epoch timestamp of last detection.
+        confidence (float): Bounding box / tracker confidence score.
+        crops (list): List of crop images (either numpy arrays, or dictionaries with 'image' key).
+        captures_dir (str, optional): Custom path to captures directory.
+        embedding (bytes, optional): Serialized embedding bytes (BLOB) for the object.
+        
+    Returns:
+        str: JSON string of relative paths of saved crop files.
+    """
+    crop_paths = save_crops_to_disk(track_id, crops, captures_dir)
     crop_paths_json = json.dumps(crop_paths)
     
     with get_db_connection() as conn:
@@ -140,14 +154,55 @@ def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, ca
         
     return crop_paths_json
 
-def update_object_result(track_id, tags, ocr_text, status):
-    """Updates the tags, OCR text, and status of an object after processing/tagging.
+def update_object_re_sighting(matched_track_id, last_seen, new_crops, captures_dir=None):
+    """Saves new crops to disk, appends their paths to the existing object's crop_paths, and updates last_seen.
+    
+    Args:
+        matched_track_id (int): Unique track identifier of the existing matched object.
+        last_seen (float): New last_seen timestamp.
+        new_crops (list): List of new crop images.
+        captures_dir (str, optional): Custom path to captures directory.
+        
+    Returns:
+        str: JSON string of combined relative paths.
+    """
+    new_crop_paths = save_crops_to_disk(matched_track_id, new_crops, captures_dir)
+    
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT crop_paths FROM objects WHERE track_id = ?", (matched_track_id,)).fetchone()
+        if row and row['crop_paths']:
+            try:
+                existing_paths = json.loads(row['crop_paths'])
+            except Exception:
+                existing_paths = []
+        else:
+            existing_paths = []
+            
+        combined_paths = existing_paths + new_crop_paths
+        combined_paths_json = json.dumps(combined_paths)
+        
+        conn.execute(
+            """
+            UPDATE objects
+            SET last_seen = ?,
+                crop_paths = ?
+            WHERE track_id = ?
+            """,
+            (last_seen, combined_paths_json, matched_track_id)
+        )
+        conn.commit()
+        
+    return combined_paths_json
+
+def update_object_result(track_id, tags, ocr_text, status, embedding=None):
+    """Updates the tags, OCR text, status, and optionally the embedding of an object.
     
     Args:
         track_id (int): Unique track identifier.
         tags (list, str or None): Tags to associate (JSON list or python list/tuple).
         ocr_text (str or None): Text extracted via OCR.
         status (str): New status ('pending', 'tagged', 'failed').
+        embedding (bytes, optional): Serialized embedding bytes (BLOB) for the object.
     """
     if status not in ('pending', 'tagged', 'failed'):
         raise ValueError("status must be one of 'pending', 'tagged', 'failed'")
@@ -159,16 +214,29 @@ def update_object_result(track_id, tags, ocr_text, status):
         tags_str = tags
         
     with get_db_connection() as conn:
-        conn.execute(
-            """
-            UPDATE objects
-            SET tags = ?,
-                ocr_text = ?,
-                status = ?
-            WHERE track_id = ?
-            """,
-            (tags_str, ocr_text, status, track_id)
-        )
+        if embedding is not None:
+            conn.execute(
+                """
+                UPDATE objects
+                SET tags = ?,
+                    ocr_text = ?,
+                    status = ?,
+                    embedding = ?
+                WHERE track_id = ?
+                """,
+                (tags_str, ocr_text, status, embedding, track_id)
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE objects
+                SET tags = ?,
+                    ocr_text = ?,
+                    status = ?
+                WHERE track_id = ?
+                """,
+                (tags_str, ocr_text, status, track_id)
+            )
         conn.commit()
 
 def search_objects(query_text):

@@ -34,8 +34,8 @@ def generate_test_images():
     cv2.rectangle(cup2, (32, 32), (122, 132), (0, 0, 255), -1)  # Red box
     cv2.putText(cup2, "COFFEE", (42, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     
-    # Object B: Green Bottle
-    bottle = np.zeros((150, 150, 3), dtype=np.uint8)
+    # Object B: Green Bottle (Gray background to differ from Red Cup)
+    bottle = np.ones((150, 150, 3), dtype=np.uint8) * 128
     cv2.rectangle(bottle, (50, 20), (100, 140), (0, 255, 0), -1)  # Green box
     cv2.putText(bottle, "WATER", (52, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
     
@@ -131,7 +131,7 @@ def main():
     ]
     
     # Note: track lifecycle requirements mandate at least 2 crops, but let's pass 2 crops of the bottle to make it realistic
-    bottle_crop_variant = np.zeros((150, 150, 3), dtype=np.uint8)
+    bottle_crop_variant = np.ones((150, 150, 3), dtype=np.uint8) * 128
     cv2.rectangle(bottle_crop_variant, (51, 21), (101, 141), (0, 255, 0), -1)
     cv2.putText(bottle_crop_variant, "WATER", (53, 81), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
     
@@ -240,9 +240,14 @@ def main():
     # --- PRINT DATABASE FINAL STATE ---
     print("\n--- Final Database Contents ---")
     with db.get_db_connection() as conn:
-        rows = conn.execute("SELECT track_id, status, confidence, tags, ocr_text FROM objects").fetchall()
+        rows = conn.execute("SELECT track_id, status, confidence, tags, ocr_text, crop_paths FROM objects").fetchall()
         for r in rows:
-            print(f"Track {r['track_id']} | Status: {r['status']} | Confidence: {r['confidence']:.2f} | Tags: {r['tags']} | OCR: '{r['ocr_text']}'")
+            try:
+                paths = json.loads(r['crop_paths'])
+                crop_count = len(paths)
+            except Exception:
+                crop_count = 0
+            print(f"Track {r['track_id']} | Status: {r['status']} | Confidence: {r['confidence']:.2f} | Crops: {crop_count} | Tags: {r['tags']} | OCR: '{r['ocr_text']}'")
             
     # Clean up files
     if os.path.exists(TEST_DB_PATH):
