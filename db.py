@@ -85,7 +85,7 @@ def init_db():
         """)
         conn.commit()
 
-def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, captures_dir=None):
+def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, captures_dir=None, embedding=None):
     """Saves crops to disk under the captures directory and inserts a 'pending' object row.
     
     Args:
@@ -95,6 +95,7 @@ def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, ca
         confidence (float): Bounding box / tracker confidence score.
         crops (list): List of crop images (either numpy arrays, or dictionaries with 'image' key).
         captures_dir (str, optional): Custom path to captures directory.
+        embedding (bytes, optional): Serialized embedding bytes (BLOB) for the object.
         
     Returns:
         str: JSON string of relative paths of saved crop files.
@@ -130,10 +131,10 @@ def insert_pending_object(track_id, first_seen, last_seen, confidence, crops, ca
     with get_db_connection() as conn:
         conn.execute(
             """
-            INSERT INTO objects (track_id, first_seen, last_seen, crop_paths, status, confidence)
-            VALUES (?, ?, ?, ?, 'pending', ?)
+            INSERT INTO objects (track_id, first_seen, last_seen, crop_paths, status, confidence, embedding)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (track_id, first_seen, last_seen, crop_paths_json, confidence)
+            (track_id, first_seen, last_seen, crop_paths_json, confidence, embedding)
         )
         conn.commit()
         

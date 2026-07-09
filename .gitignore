@@ -2,3 +2,4 @@
 /models/
 /embeddings/
 .env
+/captures

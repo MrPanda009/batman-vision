@@ -7,6 +7,263 @@ import cv2
 import torch
 import numpy as np
 from ultralytics import YOLOE
+import threading
+import json
+import base64
+import openai
+from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Ensure workspace root is in path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import db
+
+def cv2_to_base64_data_url(img):
+    """Encode an OpenCV image (numpy array) to a base64 Data URL."""
+    _, buffer = cv2.imencode('.jpg', img)
+    base64_str = base64.b64encode(buffer).decode('utf-8')
+    return f"data:image/jpeg;base64,{base64_str}"
+
+def execute_tagging_with_retries(client, messages):
+    """Executes the Nemotron-3-nano-omni-30b tagging API call.
+    Includes tenacity exponential backoff for network-level issues,
+    and a custom retry once for low confidence ('low') or JSON parsing failures.
+    """
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((
+            openai.APIConnectionError,
+            openai.APITimeoutError,
+            openai.InternalServerError,
+            openai.RateLimitError,
+            ConnectionError,
+            TimeoutError
+        )),
+        reraise=True
+    )
+    def call_api():
+        return client.chat.completions.create(
+            model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            messages=messages,
+            max_tokens=4096
+        )
+
+    for attempt in range(1, 3):
+        try:
+            response = call_api()
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Received empty content from API")
+                
+            # Parse only content as JSON, cleaning markdown code block backticks if present
+            content_clean = content.strip()
+            if content_clean.startswith("```json"):
+                content_clean = content_clean[7:]
+            elif content_clean.startswith("```"):
+                content_clean = content_clean[3:]
+            if content_clean.endswith("```"):
+                content_clean = content_clean[:-3]
+            content_clean = content_clean.strip()
+            
+            result_data = json.loads(content_clean)
+            
+            # Check for required JSON keys
+            if "object_name" not in result_data or "tags" not in result_data:
+                raise KeyError("Missing required keys ('object_name', 'tags') in API response JSON")
+                
+            confidence = result_data.get("confidence", "low").lower()
+            if confidence == "low":
+                if attempt < 2:
+                    print(f"[WORKER] API returned low confidence on attempt 1. Retrying once...")
+                    continue
+                else:
+                    raise ValueError("Low confidence response after retry")
+                    
+            return result_data
+            
+        except Exception as e:
+            if attempt < 2:
+                print(f"[WORKER] Attempt 1 failed with: {e}. Retrying once...")
+                continue
+            else:
+                raise e
+
+def tagging_worker_func(finalized_queue, model_path):
+    """Background worker thread function.
+    Loads YOLOE on CPU for embedding, instantiates OpenAI client,
+    and processes tracks from finalized_queue with de-duplication and tagging.
+    """
+    print("[WORKER] Background worker thread started. Loading YOLOE model on CPU for embeddings...")
+    embedding_model = YOLOE(model_path)
+    
+    api_key = os.environ.get("NVIDIA_API_KEY")
+    if not api_key:
+        print("[WORKER] WARNING: NVIDIA_API_KEY environment variable is not set. API calls will fail.")
+        
+    client = OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=api_key or "missing_key"
+    )
+    
+    while True:
+        item = finalized_queue.get()
+        if item is None:
+            print("[WORKER] Received stop signal. Exiting background worker...")
+            finalized_queue.task_done()
+            break
+            
+        track_id = item['track_id']
+        first_seen = item['first_seen']
+        last_seen = item['last_seen']
+        crops = item['crops']
+        
+        try:
+            # 1. Compute embedding for the new track
+            crop_imgs = [c['image'] for c in crops]
+            embs = embedding_model.embed(crop_imgs, device='cpu', verbose=False)
+            embs_tensor = torch.stack(embs)
+            mean_emb = torch.mean(embs_tensor, dim=0)
+            emb_np = mean_emb.numpy().astype(np.float32)
+            emb_bytes = emb_np.tobytes()
+            
+            # Use max confidence of all crops as tracking confidence
+            confidence = max([c['confidence'] for c in crops]) if crops else 0.0
+            
+            # 2. De-duplication check against tagged objects in DB
+            is_duplicate = False
+            best_match = None
+            highest_similarity = -1.0
+            
+            try:
+                with db.get_db_connection() as conn:
+                    rows = conn.execute(
+                        "SELECT track_id, tags, ocr_text, embedding FROM objects WHERE status = 'tagged' AND embedding IS NOT NULL"
+                    ).fetchall()
+                    
+                for row in rows:
+                    db_emb_bytes = row['embedding']
+                    db_emb = np.frombuffer(db_emb_bytes, dtype=np.float32)
+                    
+                    # Cosine similarity
+                    dot_product = np.dot(emb_np, db_emb)
+                    norm_a = np.linalg.norm(emb_np)
+                    norm_b = np.linalg.norm(db_emb)
+                    similarity = dot_product / (norm_a * norm_b) if (norm_a > 0 and norm_b > 0) else 0.0
+                    
+                    if similarity > highest_similarity:
+                        highest_similarity = similarity
+                        best_match = row
+                        
+                if highest_similarity >= 0.85 and best_match is not None:
+                    is_duplicate = True
+            except Exception as db_err:
+                print(f"[WORKER ERROR] Error querying database for de-duplication: {db_err}")
+                
+            if is_duplicate:
+                # Save crop paths to disk and insert pending row (None -> pending)
+                db.insert_pending_object(
+                    track_id=track_id,
+                    first_seen=first_seen,
+                    last_seen=last_seen,
+                    confidence=confidence,
+                    crops=crops,
+                    embedding=emb_bytes
+                )
+                print(f"[STATUS] Track {track_id} transition: None -> pending")
+                
+                # Deduplication console log
+                print(f"[DEDUP] Match found for track {track_id} with existing track {best_match['track_id']}, similarity score: {highest_similarity:.4f}")
+                
+                # Copy tags/ocr text from matched object
+                try:
+                    matched_tags = json.loads(best_match['tags']) if best_match['tags'] else []
+                except Exception:
+                    matched_tags = best_match['tags']
+                matched_ocr = best_match['ocr_text']
+                
+                # Update result (pending -> tagged)
+                db.update_object_result(track_id, matched_tags, matched_ocr, 'tagged')
+                print(f"[STATUS] Track {track_id} transition: pending -> tagged")
+                continue
+                
+            # 3. If not duplicate, insert pending row (None -> pending)
+            db.insert_pending_object(
+                track_id=track_id,
+                first_seen=first_seen,
+                last_seen=last_seen,
+                confidence=confidence,
+                crops=crops,
+                embedding=emb_bytes
+            )
+            print(f"[STATUS] Track {track_id} transition: None -> pending")
+            
+            # 4. Construct Vision API call
+            content_blocks = [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are a computer vision assistant. You are given a sequence of cropped images of the same object tracked in a video feed. "
+                        "Determine the name of the object, extract any printed text on it, and label it with descriptive tags.\n"
+                        "You MUST return ONLY a strict JSON object with no explanations, no wrapping markdown formatting code blocks, and no extra text. "
+                        "The JSON object must have EXACTLY the following keys:\n"
+                        "- 'object_name': A short, clear name/type of the object (string).\n"
+                        "- 'tags': A JSON array/list of short descriptive tags (strings, e.g. ['red', 'nylon', 'water bottle']).\n"
+                        "- 'ocr_text': Any printed characters, logos, or text visible on the object (string, empty string if none found).\n"
+                        "- 'confidence': Your confidence rating for this identification, which must be exactly one of: 'high', 'medium', or 'low'.\n"
+                        "Example:\n"
+                        '{"object_name": "keyboard", "tags": ["black", "mechanical", "plastic"], "ocr_text": "Logitech", "confidence": "high"}'
+                    )
+                }
+            ]
+            
+            for crop in crops:
+                data_url = cv2_to_base64_data_url(crop['image'])
+                content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": data_url
+                    }
+                })
+                
+            messages = [
+                {
+                    "role": "user",
+                    "content": content_blocks
+                }
+            ]
+            
+            # Call API with retry logic
+            result = execute_tagging_with_retries(client, messages)
+            
+            # Write back result (pending -> tagged)
+            db.update_object_result(
+                track_id=track_id,
+                tags=result['tags'],
+                ocr_text=result.get('ocr_text', ''),
+                status='tagged'
+            )
+            print(f"[STATUS] Track {track_id} transition: pending -> tagged")
+            
+        except Exception as err:
+            print(f"[WORKER ERROR] Permanent tagging failure for track {track_id}: {err}")
+            try:
+                db.update_object_result(
+                    track_id=track_id,
+                    tags=None,
+                    ocr_text=None,
+                    status='failed'
+                )
+                print(f"[STATUS] Track {track_id} transition: pending -> failed")
+            except Exception as db_err:
+                print(f"[WORKER ERROR] Failed to update status to failed in database for track {track_id}: {db_err}")
+                
+        finally:
+            finalized_queue.task_done()
 
 def draw_semi_transparent_rect(img, pt1, pt2, color, alpha):
     """Draw a semi-transparent rectangle on the image."""
@@ -140,6 +397,22 @@ def main():
     model = YOLOE(model_path)
     print(f"Model loaded successfully from {model_path}.")
     
+    # Initialize SQLite database
+    print("Initializing SQLite database...")
+    db.init_db()
+    
+    # Simple in-memory queue for finalized accepted tracks
+    finalized_queue = queue.Queue()
+    
+    # Start background tagging worker thread
+    print("Starting background tagging worker thread...")
+    worker_thread = threading.Thread(
+        target=tagging_worker_func,
+        args=(finalized_queue, model_path),
+        daemon=True
+    )
+    worker_thread.start()
+    
     # Path to custom ByteTrack configuration
     tracker_path = os.path.abspath(os.path.join(script_dir, "custom_bytetrack.yaml"))
 
@@ -164,9 +437,6 @@ def main():
 
     # In-memory buffer keyed by track ID
     track_buffers = {}
-
-    # Simple in-memory queue for finalized accepted tracks
-    finalized_queue = queue.Queue()
 
     # Dictionary to store active track metadata: track_id -> {first_seen, last_seen, class_counts}
     track_metadata = {}
@@ -433,15 +703,23 @@ def main():
     cv2.destroyAllWindows()
     print("Inference loop finished. Webcam released.")
 
-    # Print the final queued items for verification
-    if not finalized_queue.empty():
-        print(f"\n--- Final Queue Contents (Total: {finalized_queue.qsize()}) ---")
-        while not finalized_queue.empty():
-            item = finalized_queue.get()
-            crops_info = [f"[Crop score: {c['score']:.2f}, bbox: {c['bbox']}]" for c in item['crops']]
-            print(f"  - Track ID: {item['track_id']}, Class: {item['class_name_guess']}, "
-                  f"First seen: {item['first_seen']:.2f}, Last seen: {item['last_seen']:.2f}, "
-                  f"Crops: {len(item['crops'])} metadata: {crops_info}")
+    # Signal the background worker thread to stop and wait for it to process remaining items
+    print("\nWaiting for background tagging worker to complete remaining tasks...")
+    finalized_queue.put(None)
+    worker_thread.join()
+    print("Background worker shut down successfully.")
+
+    # Print database summary of processed objects
+    try:
+        with db.get_db_connection() as conn:
+            rows = conn.execute("SELECT track_id, status, tags, ocr_text, confidence FROM objects ORDER BY track_id ASC").fetchall()
+        if rows:
+            print(f"\n--- SQLite Database Objects (Total: {len(rows)}) ---")
+            for row in rows:
+                tags_str = row['tags']
+                print(f"  - Track ID: {row['track_id']} | Status: {row['status']} | Confidence: {row['confidence']:.2f} | Tags: {tags_str} | OCR: '{row['ocr_text']}'")
+    except Exception as db_err:
+        print(f"Error querying final database state: {db_err}")
 
 if __name__ == "__main__":
     main()
