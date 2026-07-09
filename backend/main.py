@@ -67,6 +67,7 @@ MIN_SHARPNESS = 50.0   # Minimum Laplacian variance for a crop to be considered 
 MIN_BBOX_SIZE = 1600   # Minimum bounding box area in pixels (width * height)
 MIN_CONFIDENCE = 0.25  # Minimum detection confidence score
 DEDUP_SIMILARITY_THRESHOLD = 0.9  # Threshold above which an object is considered a re-sighting
+REID_SIMILARITY_THRESHOLD = 0.65  # Threshold below which a track is split due to visual mismatch
 
 # Weights for the combined quality score (weighted combination of confidence, size, and sharpness)
 WEIGHT_CONF = 1.0
@@ -622,6 +623,65 @@ def capture_loop_func():
                             if conf >= MIN_CONFIDENCE and bbox_size >= MIN_BBOX_SIZE:
                                 sharpness = compute_blur_score(crop_img)
                                 if sharpness >= MIN_SHARPNESS:
+                                    # Visual Re-ID Check
+                                    try:
+                                        crop_emb_res = model.embed(crop_img, device=device, verbose=False)
+                                        if crop_emb_res and len(crop_emb_res) > 0:
+                                            crop_emb = crop_emb_res[0].cpu().numpy().astype(np.float32)
+                                            
+                                            if 'representative_embedding' not in track_metadata[track_id]:
+                                                track_metadata[track_id]['representative_embedding'] = crop_emb
+                                            else:
+                                                rep_emb = track_metadata[track_id]['representative_embedding']
+                                                dot_product = np.dot(crop_emb, rep_emb)
+                                                norm_a = np.linalg.norm(crop_emb)
+                                                norm_b = np.linalg.norm(rep_emb)
+                                                similarity = dot_product / (norm_a * norm_b) if (norm_a > 0 and norm_b > 0) else 0.0
+                                                
+                                                if similarity < REID_SIMILARITY_THRESHOLD:
+                                                    print(f"[TRACK SPLIT] Track {track_id} visual similarity {similarity:.4f} < {REID_SIMILARITY_THRESHOLD}. Splitting track.")
+                                                    
+                                                    # Finalize existing track early
+                                                    meta = track_metadata[track_id]
+                                                    first_seen = meta['first_seen']
+                                                    last_seen = meta['last_seen']
+                                                    total_tracked_time = last_seen - first_seen
+                                                    class_name_guess = meta['class_counts'].most_common(1)[0][0]
+                                                    
+                                                    buf = track_buffers.get(track_id)
+                                                    crops = buf.crops if buf else []
+                                                    num_crops = len(crops)
+                                                    
+                                                    if total_tracked_time >= 1.0 and num_crops >= 2:
+                                                        print(f"[TRACK LIFECYCLE - SPLIT] Track {track_id} ({class_name_guess}) finalized: ACCEPTED. "
+                                                              f"Tracked time: {total_tracked_time:.2f}s, Crops: {num_crops}")
+                                                        finalized_queue.put({
+                                                            'track_id': track_id,
+                                                            'class_name_guess': class_name_guess,
+                                                            'crops': crops,
+                                                            'first_seen': first_seen,
+                                                            'last_seen': last_seen
+                                                        })
+                                                    else:
+                                                        reason_parts = []
+                                                        if total_tracked_time < 1.0:
+                                                            reason_parts.append(f"tracked time {total_tracked_time:.2f}s < 1.0s")
+                                                        if num_crops < 2:
+                                                            reason_parts.append(f"crops count {num_crops} < 2")
+                                                        reason_str = " & ".join(reason_parts)
+                                                        print(f"[TRACK LIFECYCLE - SPLIT] Track {track_id} ({class_name_guess}) finalized: DISCARDED as noise ({reason_str}).")
+                                                        
+                                                    # Reset track structures for this track ID
+                                                    track_metadata[track_id] = {
+                                                        'first_seen': curr_time,
+                                                        'last_seen': curr_time,
+                                                        'class_counts': collections.Counter({class_name: 1}),
+                                                        'representative_embedding': crop_emb
+                                                    }
+                                                    track_buffers[track_id] = TrackBuffer()
+                                    except Exception as e:
+                                        print(f"[REID ERROR] Failed to perform visual Re-ID for track {track_id}: {e}")
+
                                     score = compute_combined_score(conf, bbox_size, sharpness)
                                     track_buffers[track_id].add_crop(
                                         crop_img, [x1_c, y1_c, x2_c, y2_c], conf, sharpness, score
